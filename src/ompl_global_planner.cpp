@@ -50,6 +50,7 @@
 #include <tf/transform_listener.h>
 
 
+
 //register this planner as a BaseGlobalPlanner plugin
 PLUGINLIB_EXPORT_CLASS(ompl_global_planner::OmplGlobalPlanner, nav_core::BaseGlobalPlanner)
 
@@ -75,8 +76,24 @@ void OmplGlobalPlanner::initialize(std::string name, costmap_2d::Costmap2DROS* c
         _frame_id = "map";
         _costmap_model = new base_local_planner::CostmapModel(*_costmap_ros->getCostmap());
 
-        _plan_pub = private_nh.advertise<nav_msgs::Path>("plan", 1);
+        x_size_of_map = _costmap_ros->getCostmap()->getSizeInMetersX(); // x size of map
+        y_size_of_map = _costmap_ros->getCostmap()->getSizeInMetersY(); // y size of map
+
+        //take config parameter part
         private_nh.param("allow_unknown", _allow_unknown, true);
+        private_nh.param("planner_type", _planner_type, std::string("RRTConnect"));
+        private_nh.param("disable_poseArray", _disable_poseArray, false);
+        private_nh.param("lethal_cost", _lethal_cost, 200.0);  // default 253.0
+        private_nh.param("time_out", _time_out, 5.0);
+
+        _plan_pub = private_nh.advertise<nav_msgs::Path>("plan", 1);
+
+        if (_disable_poseArray == true)
+        {
+            // _samples_pub = private_nh.advertise<geometry_msgs::PoseArray>("samples", 1);
+            _samples_pub = private_nh.advertise<sensor_msgs::PointCloud>("samples",1);
+            _invalid_samples_pub = private_nh.advertise<sensor_msgs::PointCloud>("invalid_samples", 1);
+        }
 
         //get the tf prefix
         ros::NodeHandle prefix_nh;
@@ -130,23 +147,34 @@ double OmplGlobalPlanner::calc_cost(const ob::State *state)
     get_xy_theta_v(state, x, y, theta, velocity);
 
     // Get the cost of the footprint at the current location:
-    double cost = _costmap_model->footprintCost(x, y, theta, _costmap_ros->getRobotFootprint());
+    double footprint_cost = _costmap_model->footprintCost(x, y, theta, _costmap_ros->getRobotFootprint());
 
-    if (cost < 0)
+    if (footprint_cost == -1)  // footprint covers at least a lethal obstacle cell
     {
-        // Unknown cell, assume zero cost here!
-        cost = 0;
+		return 255.0;
     }
+	else if (footprint_cost == -2)  // footprint covers at least a no-information cell
+	{
+		return 0.0;
+	}
+	else if (footprint_cost == -3)  // footprint is [partially] outside of the map
+	{
+		return 255.0;
+	} else
+	{
+		return footprint_cost;
+	}
 
-    return cost;
 }
 
 // Calculate the cost of a motion:
-double motion_cost(const ob::State* s1, const ob::State* s2)
+double OmplGlobalPlanner::motion_cost(const ob::State* s1, const ob::State* s2)
 {
     // int nd = validSegmentCount(s1, s2);
     // TODO: interpolate?
     double cst = 0;
+
+    std::cout << "OmplGlobalPlanner::motion_cost" << std::endl;
 
     // cst = 
 
@@ -163,23 +191,43 @@ bool OmplGlobalPlanner::isStateValid(const oc::SpaceInformation *si, const ob::S
 
     // Get the cost of the footprint at the current location:
     double cost = calc_cost(state);
+	double x, y, theta, velocity;
+	get_xy_theta_v(state, x, y, theta, velocity);
 
-    // std::cout << cost << std::endl;
-    // Too high cost:
-    if (cost > 90)
+	// Too high cost:
+    if (cost >= _lethal_cost)
     {
-        return false;
+        if (_disable_poseArray == true)
+        {
+            geometry_msgs::Point32 invalid_pose;
+            invalid_pose.x = x;
+            invalid_pose.y = y;
+            invalid_pose.z = 0.0;
+            _invalid_samples.points.push_back(invalid_pose);
+        }
+
+		return false;
+    }
+
+    if (_disable_poseArray == true) {
+        geometry_msgs::Point32 pose;
+        pose.x = x;
+        pose.y= y;
+        pose.z = 0.0;
+        _samples.points.push_back(pose);
     }
 
     // Error? Unknown space?
     if (cost < 0)
     {
+        std::cout << "COST LOWER THAN ZERO" << std::endl;
+        return false;
     }
 
     return true;
 }
 
-// Calculate vehicle dynamics, assume a velocity state, but steering to be instantly possibe.
+// Calculate vehicle dynamics, assume a velocity state, but steering to be instantly possible.
 void OmplGlobalPlanner::propagate(const ob::State *start, const oc::Control *control, const double duration, ob::State* result)
 {
     // Implement vehicle dynamics:
@@ -197,7 +245,7 @@ void OmplGlobalPlanner::propagate(const ob::State *start, const oc::Control *con
     y_n = y + velocity * duration * sin(theta);
     velocity_n = velocity + acc * duration;
 
-    double vehicle_length = 0.4;
+    double vehicle_length = 0.2;
     double lengthInv = 1 / vehicle_length;
     double omega = velocity * lengthInv * tan(steer_angle);
     theta_n = theta + omega * duration;
@@ -213,13 +261,6 @@ double calcYaw(const geometry_msgs::Pose pose)
     tf::poseMsgToTF(pose, pose_tf);
     pose_tf.getBasis().getEulerYPR(yaw, pitch, roll);
     return yaw;
-}
-
-void pose2state(const geometry_msgs::Pose& pose, ob::State* state)
-{
-    //ompl_start[0] = start.pose.position.x;
-    //ompl_start[1] = start.pose.position.y;
-    //ompl_start[2] = calcYaw(start.pose);
 }
 
 bool OmplGlobalPlanner::makePlan(const geometry_msgs::PoseStamped& start, const geometry_msgs::PoseStamped& goal,
@@ -251,9 +292,6 @@ bool OmplGlobalPlanner::makePlan(const geometry_msgs::PoseStamped& start, const 
         return false;
     }
 
-    double wx = start.pose.position.x;
-    double wy = start.pose.position.y;
-
     //clear the starting cell within the costmap because we know it can't be an obstacle
     tf::Stamped<tf::Pose> start_pose;
     tf::poseStampedMsgToTF(start, start_pose);
@@ -261,27 +299,37 @@ bool OmplGlobalPlanner::makePlan(const geometry_msgs::PoseStamped& start, const 
     ROS_INFO("Thinking about OMPL path..");
     // Create OMPL problem:
     ob::RealVectorBounds bounds(2);
-    bounds.setLow(-10);
-    bounds.setHigh(10);
+    double x_size_positive = x_size_of_map/2.0;
+    double y_size_positive = y_size_of_map/2.0;
+    double x_size_negative = x_size_of_map/(-2.0);
+    double y_size_negative = y_size_of_map/(-2.0);
+    bounds.setLow(0,x_size_negative);
+    bounds.setHigh(0,x_size_positive);
+    bounds.setLow(1,y_size_negative);
+    bounds.setHigh(1,y_size_positive);
     _se2_space->as<ob::SE2StateSpace>()->setBounds(bounds);
 
     ob::RealVectorBounds velocity_bounds(1);
-    velocity_bounds.setHigh(0.6);
-    velocity_bounds.setLow(-0.1);
+    velocity_bounds.setHigh(0.2);
+    velocity_bounds.setLow(-0.2);
     _velocity_space->as<ob::RealVectorStateSpace>()->setBounds(velocity_bounds);
 
     oc::ControlSpacePtr cspace(new oc::RealVectorControlSpace(_space, 2));
     ob::RealVectorBounds cbounds(2);
-    cbounds.setLow(0, -0.04);
-    cbounds.setHigh(0, 0.3);
-    cbounds.setLow(1, -0.2);
-    cbounds.setHigh(1, 0.2);
+    cbounds.setLow(-0.3);
+    cbounds.setHigh(0.3);
     cspace->as<oc::RealVectorControlSpace>()->setBounds(cbounds);
 
     // Create space information:
     oc::SpaceInformationPtr si(new oc::SpaceInformation(_space, cspace));
-    si->setStatePropagator(boost::bind(&OmplGlobalPlanner::propagate, this, _1, _2, _3,_4));
+
     si->setStateValidityChecker(boost::bind(&OmplGlobalPlanner::isStateValid, this, si.get(), _1));
+    si->setStatePropagator(boost::bind(&OmplGlobalPlanner::propagate, this, _1, _2, _3, _4));
+
+
+    //added because of warnings
+    si->setMinMaxControlDuration(1,10);
+    si->setPropagationStepSize(0.2);
 
     // Define problem:
     ob::ScopedState<> ompl_start(_space);
@@ -296,39 +344,59 @@ bool OmplGlobalPlanner::makePlan(const geometry_msgs::PoseStamped& start, const 
     ompl_goal[2] = calcYaw(start.pose);
     ompl_goal[3] = 0; // Speed
 
+
     // Optimize criteria:
-    ob::OptimizationObjectivePtr cost_objective(new CostMapObjective(*this, si));
+    //ob::OptimizationObjectivePtr clearance(getClearanceObjective(si));
+    //ob::OptimizationObjectivePtr cost_objective(new CostMapObjective(*this, si));
     ob::OptimizationObjectivePtr length_objective(new ob::PathLengthOptimizationObjective(si));
     //ob::OptimizationObjectivePtr objective(new CostMapWorkObjective(*this, si));
 
     ob::ProblemDefinitionPtr pdef(new ob::ProblemDefinition(si));
-    pdef->setStartAndGoalStates(ompl_start, ompl_goal, 0.1);
-    pdef->setOptimizationObjective(cost_objective + length_objective);
+
+    //added from Sauravag fork
+    //ob::MultiOptimizationObjective* multOptimObjective = new ob::MultiOptimizationObjective(si);
+    //multOptimObjective->addObjective(cost_objective, 5.0);
+    //multOptimObjective->addObjective(length_objective, 1.0);
+
+    pdef->setStartAndGoalStates(ompl_start, ompl_goal, 0.05);
+    //pdef->setOptimizationObjective(clearance);
+    //pdef->setOptimizationObjective(cost_objective);
+    //pdef->setOptimizationObjective(cost_objective + length_objective);
+    pdef->setOptimizationObjective(length_objective);
 
     ROS_INFO("Problem defined, running planner");
-    // oc::DecompositionPtr decomp(new My
-    // ob::PlannerPtr planner(new oc::LBTRRT(si));
-    // ob::PlannerPtr planner(new og::RRTConnect(si));
-    ob::PlannerPtr planner(new og::RRTstar(si));
-    // ob::PlannerPtr planner(new og::PRMstar(si)); // works
-    // ob::PlannerPtr planner(new og::PRM(si)); // segfault
-    // ob::PlannerPtr planner(new og::TRRT(si));
-    planner->setProblemDefinition(pdef);
-    planner->setup();
-    ob::PlannerStatus solved = planner->solve(3.0);
 
+    if(_planner_type == "RRTConnect"){
+        _planner = ob::PlannerPtr(new og::RRTConnect(si));
+    }
+    else if(_planner_type == "RRTStar"){
+        //auto aa(std::make_shared<og::RRTstar>(si));
+        //aa->printSettings(std::cout);
+        //_planner = ob::PlannerPtr(aa);
+        _planner = ob::PlannerPtr(new og::RRTstar(si));
+    }
+    else if(_planner_type == "PRMStar"){
+        _planner = ob::PlannerPtr(new og::PRMstar(si));
+    }
+    else{
+        ROS_ERROR("Planner type did not defined");
+    }
+
+    _planner->setProblemDefinition(pdef);
+    _planner->setup();
+
+
+    ob::PlannerStatus solved = _planner->solve(_time_out);
 
     // Convert path into ROS messages:
-    if (solved)
+    if (solved.asString() == "Exact solution")  // TODO check if all samples were interpolated
     {
         ROS_INFO("Ompl done!");
         ob::PathPtr result_path1 = pdef->getSolutionPath();
 
         // Cast path into geometric path:
         og::PathGeometric& result_path = static_cast<og::PathGeometric&>(*result_path1);
-
-        // result_path.interpolate(100);
-        // result_path->print(std::cout);
+        result_path.interpolate();
 
         // Create path:
         plan.push_back(start);
@@ -350,16 +418,23 @@ bool OmplGlobalPlanner::makePlan(const geometry_msgs::PoseStamped& start, const 
         }
 
         plan.push_back(goal);
+
+    }
+    else if (solved.asString() == "Approximate solution"){
+        ROS_WARN("Did not find Exact Solution");
+        //plan.push_back(start);
+        //plan.push_back(start);
+        return false;
     }
     else
     {
         ROS_ERROR("Failed to determine plan");
     }
 
-
     //publish the plan for visualization purposes
     publishPlan(plan);
     return !plan.empty();
+
 }
 
 void OmplGlobalPlanner::publishPlan(const std::vector<geometry_msgs::PoseStamped>& path)
@@ -374,18 +449,63 @@ void OmplGlobalPlanner::publishPlan(const std::vector<geometry_msgs::PoseStamped
     nav_msgs::Path gui_path;
     gui_path.poses.resize(path.size());
 
+
     if (!path.empty()) {
         gui_path.header.frame_id = path[0].header.frame_id;
         gui_path.header.stamp = path[0].header.stamp;
     }
+
 
     // Extract the plan in world co-ordinates, we assume the path is all in the same frame
     for (unsigned int i = 0; i < path.size(); i++) {
         gui_path.poses[i] = path[i];
     }
 
+    // for visualisation
+    if (_disable_poseArray == true )
+    {
+        _samples.header.frame_id = "map";
+        _samples.header.stamp = ros::Time::now();
+        _invalid_samples.header.frame_id = "map";
+        _invalid_samples.header.stamp = ros::Time::now();
+        _samples_pub.publish(_samples);
+        _invalid_samples_pub.publish(_invalid_samples);
+        _samples.points.clear();
+        _invalid_samples.points.clear();
+    }
+
     _plan_pub.publish(gui_path);
+
 }
+
+/*
+    class ClearanceObjective : public ob::StateCostIntegralObjective
+    {
+    public:
+        ClearanceObjective(const ob::SpaceInformationPtr& si) :
+                ob::StateCostIntegralObjective(si, true)
+        {
+        }
+
+        // Our requirement is to maximize path clearance from obstacles,
+        // but we want to represent the objective as a path cost
+        // minimization. Therefore, we set each state's cost to be the
+        // reciprocal of its clearance, so that as state clearance
+        // increases, the state cost decreases.
+        ob::Cost stateCost(const ob::State* s) const override
+        {
+            return ob::Cost(1 / (si_->getStateValidityChecker()->clearance(s) +
+                                 std::numeric_limits<double>::min()));
+        }
+    };*/
+
+/** Return an optimization objective which attempts to steer the robot
+    away from obstacles. */
+/*    ob::OptimizationObjectivePtr getClearanceObjective(const ob::SpaceInformationPtr& si)
+    {
+        return std::make_shared<ClearanceObjective>(si);
+    }*/
+
 
 
 } //end namespace global_planner

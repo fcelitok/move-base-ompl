@@ -1,5 +1,5 @@
 <package>
-  <name>move_base_ompl</name>
+  <name>ompl_global_planner</name>
   <version>0.0.1</version>
   <description>
     ROS move-base planner plugin using ompl

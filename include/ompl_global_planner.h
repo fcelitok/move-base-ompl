@@ -44,7 +44,9 @@
 
 #include <ros/ros.h>
 #include <costmap_2d/costmap_2d.h>
+#include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Point.h>
 #include <nav_msgs/Path.h>
 #include <tf/transform_datatypes.h>
@@ -64,6 +66,7 @@
 #include <ompl/base/objectives/StateCostIntegralObjective.h>
 #include <ompl/base/objectives/MechanicalWorkOptimizationObjective.h>
 #include <ompl/base/objectives/PathLengthOptimizationObjective.h>
+#include <ompl/base/MotionValidator.h>
 
 namespace ob = ompl::base;
 namespace oc = ompl::control;
@@ -96,11 +99,24 @@ class OmplGlobalPlanner : public nav_core::BaseGlobalPlanner
         void set_xy_theta_v(ob::State*, double x, double y, double theta, double velocity);
 
     private:
-        costmap_2d::Costmap2DROS* _costmap_ros;
-        std::string _frame_id;
+
+		//geometry_msgs::PoseArray _samples;
+        sensor_msgs::PointCloud _samples;
+        sensor_msgs::PointCloud _invalid_samples;
+		costmap_2d::Costmap2DROS* _costmap_ros;
+		std::string _frame_id;
         ros::Publisher _plan_pub;
+        ros::Publisher _samples_pub;
+        ros::Publisher _invalid_samples_pub;
         bool _initialized;
         bool _allow_unknown;
+        bool _disable_poseArray;
+        double _lethal_cost;
+        double _time_out;
+        std::string _planner_type;
+
+        double x_size_of_map;
+        double y_size_of_map;
 
         std::string tf_prefix_;
         boost::mutex _mutex;
@@ -110,8 +126,10 @@ class OmplGlobalPlanner : public nav_core::BaseGlobalPlanner
         ob::StateSpacePtr _se2_space;
         ob::StateSpacePtr _velocity_space;
         ob::StateSpacePtr _space;
+        ob::PlannerPtr _planner;
 };
 
+   // ob::OptimizationObjectivePtr getClearanceObjective(const ob::SpaceInformationPtr& si);
 
 class CostMapObjective : public ob::StateCostIntegralObjective
 {
@@ -144,15 +162,14 @@ class CostMapWorkObjective : public ob::MechanicalWorkOptimizationObjective
 
     ob::Cost stateCost(const ob::State* s) const
     {
-        return ob::Cost(_ompl_planner.calc_cost(s));
+        //return ob::Cost(_ompl_planner.calc_cost(s));
+        return ob::Cost( ob::MechanicalWorkOptimizationObjective::stateCost(s));
     }
 
-    /*
     ob::Cost motionCost(const ob::State* s1, const ob::State* s2) const
     {
         return ob::Cost(_ompl_planner.motion_cost(s1, s2));
     }
-    */
 
     private:
         OmplGlobalPlanner& _ompl_planner;
