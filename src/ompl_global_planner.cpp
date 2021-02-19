@@ -367,13 +367,22 @@ bool OmplGlobalPlanner::makePlan(const geometry_msgs::PoseStamped& start, const 
     ROS_INFO("Problem defined, running planner");
 
     if(_planner_type == "RRTConnect"){
-        _planner = ob::PlannerPtr(new og::RRTConnect(si));
+        auto rrtconnect(std::make_shared<og::RRTConnect>(si));
+        rrtconnect->setRange(5.0);
+        _planner = ob::PlannerPtr(rrtconnect);
+
+        // _planner = ob::PlannerPtr(new og::RRTConnect(si));
     }
     else if(_planner_type == "RRTStar"){
         //auto aa(std::make_shared<og::RRTstar>(si));
         //aa->printSettings(std::cout);
         //_planner = ob::PlannerPtr(aa);
-        _planner = ob::PlannerPtr(new og::RRTstar(si));
+        
+        auto rrtstar(std::make_shared<og::RRTstar>(si));
+        rrtstar->setRange(5.0);
+        _planner = ob::PlannerPtr(rrtstar);
+        
+        // _planner = ob::PlannerPtr(new og::RRTstar(si));
     }
     else if(_planner_type == "PRMStar"){
         _planner = ob::PlannerPtr(new og::PRMstar(si));
